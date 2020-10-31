@@ -2,6 +2,7 @@ extern crate proc_macro;
 use std::{iter::FromIterator, ops::Range};
 
 use heck::{CamelCase, SnekCase};
+use itertools::Itertools;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -122,17 +123,23 @@ struct Service {
 struct Characteristic {
     attributes: Range<usize>,
     descriptors: Range<usize>,
+    name: Option<Ident>,
+    type_name: Path,
 }
 
 #[derive(Debug)]
 struct Descriptor {
     attributes: Range<usize>,
+    name: Option<Ident>,
+    type_name: Path,
 }
 
 #[derive(Debug)]
 struct Attribute {
     data: String,
     size: usize,
+    name: Option<Ident>,
+    type_name: Path,
 }
 
 #[derive(Debug)]
@@ -191,6 +198,8 @@ fn recurse_structs(server: &mut GattServer, input: &StructLike) {
             server.characteristics.push(Characteristic {
                 attributes: ac..ac + attributes.len(),
                 descriptors: dc..dc + descriptors.len(),
+                name: input.name.clone(),
+                type_name: input.type_name.clone(),
             });
         }
         Kind::Descriptor => {
@@ -207,12 +216,16 @@ fn recurse_structs(server: &mut GattServer, input: &StructLike) {
             }
             server.descriptors.push(Descriptor {
                 attributes: ac..ac + attributes.len(),
+                name: input.name.clone(),
+                type_name: input.type_name.clone(),
             });
         }
         Kind::Attribute => {
             let attribute = Attribute {
                 data: input.type_name.get_ident().unwrap().to_string(),
                 size: input.size.base10_parse().unwrap(), // TODO: Get rid of unwrap.
+                name: input.name.clone(),
+                type_name: input.type_name.clone(),
             };
             if input.children.len() > 0 {
                 // TODO: Error
@@ -237,8 +250,6 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
         recurse_structs(&mut server, &child);
     }
 
-    println!("{:#?}", server);
-
     let attribute_count = server.attributes.len();
     let mut store_size = 0;
 
@@ -246,13 +257,14 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
         .attributes
         .iter()
         .map(|a| {
-            let previous_size = store_size;
+            let start = store_size;
+            let size = a.size;
             store_size += a.size;
             quote! {
                 Attribute {
                     att_type: 0,
                     handle: 0,
-                    value: &DATA_STORE[#previous_size..#store_size],
+                    value: unsafe { core::mem::transmute::<&'static u8, &'static [u8; #size]>(&DATA_STORE[#start]) }
                 }
             }
         })
@@ -270,8 +282,10 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
             let c_end = s.characteristics.end;
             quote! {
                 Service {
-                    attributes: &ATTRIBUTES[#a_start..#a_end],
-                    characteristics: &CHARACTERISTICS[#c_start..#c_end]
+                    // attributes: &ATTRIBUTES[#a_start..#a_end],
+                    // characteristics: &CHARACTERISTICS[#c_start..#c_end]
+                    attributes: &[],
+                    characteristics: &[]
                 }
             }
         })
@@ -289,8 +303,10 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
             let c_end = s.descriptors.end;
             quote! {
                 Characteristic {
-                    attributes: &ATTRIBUTES[#a_start..#a_end],
-                    descriptors: &DESCRIPTORS[#c_start..#c_end]
+                    // attributes: &ATTRIBUTES[#a_start..#a_end],
+                    // descriptors: &DESCRIPTORS[#c_start..#c_end]
+                    attributes: &[],
+                    descriptors: &[]
                 }
             }
         })
@@ -306,13 +322,14 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
             let a_end = s.attributes.end;
             quote! {
                 Descriptor {
-                    attributes: &ATTRIBUTES[#a_start..#a_end],
+                    // attributes: &ATTRIBUTES[#a_start..#a_end],
+                    attributes: &[],
                 }
             }
         })
         .collect::<Vec<_>>();
 
-    let service_getters = server
+    let (service_getters, service_types) = server
         .services
         .iter()
         .enumerate()
@@ -327,9 +344,257 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
                 })
                 .unwrap();
             let type_name = s.type_name.clone();
+            let handle_type_name = &mut s.type_name.clone();
+            let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+            *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+
+            let (cfn_name, chandle_name) = server.characteristics[s.characteristics.clone()].iter().map(|c| {
+                let fn_name = c
+                    .name
+                    .clone()
+                    .or_else(|| {
+                        c.type_name
+                            .get_ident()
+                            .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                    })
+                    .unwrap();
+                let mut handle_type_name = c.type_name.clone();
+                let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+                *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+                (fn_name, handle_type_name)
+            }).unzip::<_, _, Vec<_>, Vec<_>>();
+
+            (quote! {
+                pub fn #fn_name(&mut self) -> #handle_type_name {
+                    #handle_type_name {
+                        pd: core::marker::PhantomData {}
+                    }
+                }
+            },
             quote! {
-                pub fn #fn_name() -> &'static #type_name {
-                    unsafe { core::mem::transmute(&SERVICES[#i]) }
+                pub struct #handle_type_name<'a> {
+                    pd: core::marker::PhantomData<&'a mut ()>
+                }
+
+                impl core::ops::Deref for #handle_type_name<'_> {
+                    type Target = #type_name;
+
+                    fn deref(&self) -> &Self::Target {
+                        unsafe { core::mem::transmute(&SERVICES[#i]) }
+                    }
+                }
+
+                impl core::ops::DerefMut for #handle_type_name<'_> {
+                    fn deref_mut(&mut self) -> &mut Self::Target {
+                        unsafe {
+                            &mut *(core::mem::transmute::<&Service, &#type_name>(&SERVICES[0usize])
+                            as *const #type_name as *mut #type_name)
+                        }
+                    }
+                }
+
+                impl #handle_type_name<'_> {
+                    #(
+                        pub fn #cfn_name(&mut self) -> #chandle_name {
+                            #chandle_name {
+                                pd: core::marker::PhantomData {}
+                            }
+                        }
+                    )*
+                }
+            })
+        })
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+
+    let characteristic_types = server
+        .characteristics
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let fn_name = s
+                .name
+                .clone()
+                .or_else(|| {
+                    s.type_name
+                        .get_ident()
+                        .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                })
+                .unwrap();
+            let type_name = s.type_name.clone();
+            let handle_type_name = &mut s.type_name.clone();
+            let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+            *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+
+            let (cfn_name, chandle_name) = server.descriptors[s.descriptors.clone()].iter().map(|c| {
+                let fn_name = c
+                    .name
+                    .clone()
+                    .or_else(|| {
+                        c.type_name
+                            .get_ident()
+                            .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                    })
+                    .unwrap();
+                let mut handle_type_name = c.type_name.clone();
+                let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+                *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+                (fn_name, handle_type_name)
+            }).unzip::<_, _, Vec<_>, Vec<_>>();
+
+            quote! {
+                pub struct #handle_type_name<'a> {
+                    pd: core::marker::PhantomData<&'a mut ()>
+                }
+
+                impl core::ops::Deref for #handle_type_name<'_> {
+                    type Target = #type_name;
+
+                    fn deref(&self) -> &Self::Target {
+                        unsafe { core::mem::transmute(&CHARACTERISTICS[#i]) }
+                    }
+                }
+
+                impl core::ops::DerefMut for #handle_type_name<'_> {
+                    fn deref_mut(&mut self) -> &mut Self::Target {
+                        unsafe {
+                            &mut *(core::mem::transmute::<&Characteristic, &#type_name>(&CHARACTERISTICS[0usize])
+                            as *const #type_name as *mut #type_name)
+                        }
+                    }
+                }
+
+                impl #handle_type_name<'_> {
+                    #(
+                        pub fn #cfn_name(&mut self) -> #chandle_name {
+                            #chandle_name {
+                                pd: core::marker::PhantomData {}
+                            }
+                        }
+                    )*
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let descriptor_types = server
+        .descriptors
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let fn_name = s
+                .name
+                .clone()
+                .or_else(|| {
+                    s.type_name
+                        .get_ident()
+                        .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                })
+                .unwrap();
+            let type_name = s.type_name.clone();
+            let handle_type_name = &mut s.type_name.clone();
+            let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+            *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+
+            let (cfn_name, chandle_name) = server.attributes[s.attributes.clone()].iter().map(|c| {
+                let fn_name = c
+                    .name
+                    .clone()
+                    .or_else(|| {
+                        c.type_name
+                            .get_ident()
+                            .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                    })
+                    .unwrap();
+                let mut handle_type_name = c.type_name.clone();
+                let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+                *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+                (fn_name, handle_type_name)
+            }).unzip::<_, _, Vec<_>, Vec<_>>();
+
+            quote! {
+                pub struct #handle_type_name<'a> {
+                    pd: core::marker::PhantomData<&'a mut ()>
+                }
+
+                impl core::ops::Deref for #handle_type_name<'_> {
+                    type Target = #type_name;
+
+                    fn deref(&self) -> &Self::Target {
+                        unsafe { core::mem::transmute(&DESCRIPTORS[#i]) }
+                    }
+                }
+
+                impl core::ops::DerefMut for #handle_type_name<'_> {
+                    fn deref_mut(&mut self) -> &mut Self::Target {
+                        unsafe {
+                            &mut *(core::mem::transmute::<&Descriptor, &#type_name>(&DESCRIPTORS[0usize])
+                            as *const #type_name as *mut #type_name)
+                        }
+                    }
+                }
+
+                impl #handle_type_name<'_> {
+                    #(
+                        pub fn #cfn_name(&mut self) -> #chandle_name {
+                            #chandle_name {
+                                inner: unsafe { &mut *(&ATTRIBUTES[0usize] as *const Attribute as *mut Attribute) }
+                            }
+                        }
+                    )*
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let attribute_types = server
+        .attributes
+        .iter()
+        .unique_by(|s| s.type_name.clone())
+        .map(|s| {
+            let fn_name = s
+                .name
+                .clone()
+                .or_else(|| {
+                    s.type_name
+                        .get_ident()
+                        .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                })
+                .unwrap();
+            let type_name = s.type_name.clone();
+            let handle_type_name = &mut s.type_name.clone();
+            let ident = &mut handle_type_name.segments.last_mut().unwrap().ident;
+            *ident = Ident::new(&(ident.to_string() + "Handle"), ident.span());
+
+            quote! {
+                pub struct #handle_type_name<'a> {
+                    inner: &'a mut Attribute,
+                }
+
+                impl core::ops::Deref for #handle_type_name<'_> {
+                    type Target = #type_name;
+
+                    fn deref(&self) -> &Self::Target {
+                        unsafe { core::mem::transmute(&self.inner) }
+                    }
+                }
+
+                impl core::ops::DerefMut for #handle_type_name<'_> {
+                    fn deref_mut(&mut self) -> &mut Self::Target {
+                        unsafe {
+                            &mut *(core::mem::transmute::<&Attribute, &#type_name>(&self.inner)
+                            as *const #type_name as *mut #type_name)
+                        }
+                    }
+                }
+
+                impl #handle_type_name<'_> {
+                    pub fn get(&self) -> &[u8] {
+                        &self.inner.value
+                    }
+
+                    pub fn set(&mut self, value: &[u8]) {
+                        unsafe { self.inner.value.copy_from_slice(value); }
+                    }
                 }
             }
         })
@@ -343,11 +608,33 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
             static SERVICES: [Service; #service_count] = [#(#services,)*];
             static CHARACTERISTICS: [Characteristic; #characteristic_count] = [#(#characteristics,)*];
             static DESCRIPTORS: [Descriptor; #descriptor_count] = [#(#descriptors,)*];
+            
+            static mut GAT_SERVER_TAKEN: bool = false;
 
-            pub mod services {
-                use super::*;
+            pub struct GattServer {}
+
+            impl GattServer {
+                pub fn take() -> Option<Self> {
+                    // TODO:
+                    // cortex_m::interrupt::free(|_| {
+                        if unsafe { GAT_SERVER_TAKEN } {
+                            None
+                        } else {
+                            Some(GattServer {})
+                        }
+                    // })
+                }
+
                 #(#service_getters)*
             }
+            
+            #(#service_types)*
+
+            #(#characteristic_types)*
+
+            #(#descriptor_types)*
+
+            #(#attribute_types)*
         }
     })
     .into()

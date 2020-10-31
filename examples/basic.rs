@@ -1,8 +1,9 @@
 use gatt::*;
 
-struct CharacteristicA {}
-
-struct DescriptorA {}
+#[repr(transparent)]
+pub struct CharacteristicA(Characteristic);
+#[repr(transparent)]
+pub struct DescriptorA(Descriptor);
 
 struct Attribute {
     /// The type of the attribute as a UUID16, EG "Primary Service" or "Anaerobic Heart Rate Lower Limit"
@@ -11,7 +12,7 @@ struct Attribute {
     pub handle: usize,
     /// Attribute values can be any fixed length or variable length octet array, which if too large
     /// can be sent across multiple PDUs
-    pub value: &'static [u8],
+    pub value: &'static mut [u8],
 }
 
 struct Descriptor {
@@ -31,10 +32,19 @@ struct Service {
 trait ServiceTrait {}
 
 #[repr(transparent)]
-struct ServiceA(Service);
+pub struct ServiceA(Service);
 
 #[repr(transparent)]
-struct ServiceB(Service);
+pub struct ServiceB(Service);
+
+#[repr(transparent)]
+pub struct AttributeA(Attribute);
+#[repr(transparent)]
+pub struct AttributeB(Attribute);
+#[repr(transparent)]
+pub struct AttributeC(Attribute);
+#[repr(transparent)]
+pub struct AttributeD(Attribute);
 
 impl ServiceA {
     fn kek(&mut self) {}
@@ -49,32 +59,26 @@ gatt_server! {
                 attribute c: AttributeC { 3 },
             }
         },
-        characteristic: CharacteristicA {
-            descriptor: DescriptorA {
-                attribute: AttributeA { 5 },
-                attribute b: AttributeB,
-                attribute c: AttributeC { 7 },
-            }
-        },
         attribute: AttributeD
     },
     service: ServiceB {
-        characteristic: CharacteristicA {
-            descriptor: DescriptorA {
-                attribute: AttributeA,
-                attribute b: AttributeB,
-                attribute c: AttributeC,
-            }
-        },
         attribute: AttributeD { 1 }
     },
 }
 
 fn main() {
-    // cli! {
-    //     f32
-    // }
-    // println!("{}", kek);
+    let mut server = gatt_server::GattServer::take().unwrap();
+    server.service_a().kek();
+    let mut s = server.service_a();
+    let mut c = s.characteristic_a();
+    let mut d = c.descriptor_a();
+    let a = d.attribute_a();
+    let v = a.get();
 
-    gatt_server::services::service_a().kek();
+    server
+        .service_a()
+        .characteristic_a()
+        .descriptor_a()
+        .b()
+        .set(v);
 }
