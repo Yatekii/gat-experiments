@@ -1,7 +1,7 @@
 extern crate proc_macro;
 use std::{iter::FromIterator, ops::Range};
 
-use heck::CamelCase;
+use heck::{CamelCase, SnekCase};
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -114,6 +114,8 @@ impl Parse for GattServerParsed {
 struct Service {
     attributes: Range<usize>,
     characteristics: Range<usize>,
+    name: Option<Ident>,
+    type_name: Path,
 }
 
 #[derive(Debug)]
@@ -164,6 +166,8 @@ fn recurse_structs(server: &mut GattServer, input: &StructLike) {
             server.services.push(Service {
                 attributes: ac..ac + attributes.len(),
                 characteristics: cc..cc + characteristics.len(),
+                name: input.name.clone(),
+                type_name: input.type_name.clone(),
             });
         }
         Kind::Characteristic => {
@@ -254,9 +258,97 @@ pub fn gatt_server(input: TokenStream) -> TokenStream {
         })
         .collect::<Vec<_>>();
 
+    let service_count = server.services.len();
+
+    let services = server
+        .services
+        .iter()
+        .map(|s| {
+            let a_start = s.attributes.start;
+            let a_end = s.attributes.end;
+            let c_start = s.characteristics.start;
+            let c_end = s.characteristics.end;
+            quote! {
+                Service {
+                    attributes: &ATTRIBUTES[#a_start..#a_end],
+                    characteristics: &CHARACTERISTICS[#c_start..#c_end]
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let characteristic_count = server.characteristics.len();
+
+    let characteristics = server
+        .characteristics
+        .iter()
+        .map(|s| {
+            let a_start = s.attributes.start;
+            let a_end = s.attributes.end;
+            let c_start = s.descriptors.start;
+            let c_end = s.descriptors.end;
+            quote! {
+                Characteristic {
+                    attributes: &ATTRIBUTES[#a_start..#a_end],
+                    descriptors: &DESCRIPTORS[#c_start..#c_end]
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let descriptor_count = server.descriptors.len();
+
+    let descriptors = server
+        .descriptors
+        .iter()
+        .map(|s| {
+            let a_start = s.attributes.start;
+            let a_end = s.attributes.end;
+            quote! {
+                Descriptor {
+                    attributes: &ATTRIBUTES[#a_start..#a_end],
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let service_getters = server
+        .services
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let fn_name = s
+                .name
+                .clone()
+                .or_else(|| {
+                    s.type_name
+                        .get_ident()
+                        .map(|i| Ident::new(&i.to_string().to_snek_case(), i.span()))
+                })
+                .unwrap();
+            let type_name = s.type_name.clone();
+            quote! {
+                pub fn #fn_name() -> &'static #type_name {
+                    unsafe { core::mem::transmute(&SERVICES[#i]) }
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
     (quote! {
-        static DATA_STORE: [u8; #store_size] = [0; #store_size];
-        static ATTRIBUTES: [Attribute<'static>; #attribute_count] = [#(#attributes,)*];
+        mod gatt_server {
+            use super::*;
+            static DATA_STORE: [u8; #store_size] = [0; #store_size];
+            static ATTRIBUTES: [Attribute; #attribute_count] = [#(#attributes,)*];
+            static SERVICES: [Service; #service_count] = [#(#services,)*];
+            static CHARACTERISTICS: [Characteristic; #characteristic_count] = [#(#characteristics,)*];
+            static DESCRIPTORS: [Descriptor; #descriptor_count] = [#(#descriptors,)*];
+
+            pub mod services {
+                use super::*;
+                #(#service_getters)*
+            }
+        }
     })
     .into()
 }
